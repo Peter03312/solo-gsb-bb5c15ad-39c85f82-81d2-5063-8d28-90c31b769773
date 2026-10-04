@@ -173,6 +173,31 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 裁决只考虑**有效集合**：已批准、当前未暂停且未被撤销的申请。待审批、已暂停、
 已撤销均不参与。
 
+### 数据库候选集预筛（先缩范围，再精确裁决）
+
+申请量增长后，单笔预览/批准、整组批准、暂停后恢复、候补队列重裁、预约到期重裁、
+紧急占用及其解除恢复等每条裁决链，都先在数据库侧按以下三个维度把候选行缩小，
+再沿用上面的精确圆/半开时段/闭频段与保护带宽规则：
+
+1. **时段**：左闭右开区间可能相交（`row.start < 候选.end` 且
+   `row.end > 候选.start`，SQL 比较含端点，宁可多取）；
+2. **覆盖范围**：以覆盖圆外接矩形做保守相交判断（两圆心坐标差不超过
+   各自半径之和），精确的圆心距判定随后在内存执行；
+3. **频段**：闭频段可能相交（`row.freq_low <= 候选.high` 且
+   `row.freq_high >= 候选.low`）。
+
+- 整组 / 候补 / 紧急恢复 / 预约到期等一次涉及多个候选的链，先用所有候选的
+  **并集包络盒**缩一次库，再对每个候选逐行套用精确规则；
+- 预筛**只允许多取、绝不漏取**：边界统一按包含比较并加极小 epsilon，相切、
+  间隔恰好等于保护带宽等临界记录一定仍在候选集内，最终冲突明细、顺序与
+  裁决结果与全量装入完全一致（差分测试覆盖）；
+- **保护带宽只扩张许可干扰范围**（候选频段包络两侧各加保护带宽），**不扩张
+  管制窗口**：窗口预筛只用闭频段本身；
+- 可用频段下界查询的预筛包络覆盖**整个候选下界区间**
+  `[candidate_low_min, candidate_low_max + 带宽]`；
+- **保护带宽变更仍是例外**：预览与确认都装入**全部当前有效许可**两两检查，
+  不做任何裁剪。
+
 ### 临时停机：暂停与恢复
 
 活动设备临时停机时，运营人员无需撤销许可或重提申请，可对已获批（`approved`）且
@@ -1173,6 +1198,8 @@ curl -i -X POST http://localhost:8000/api/applications/2/available-ranges \
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
 （`./examples/walkthrough.sh http://localhost:8000`），其中第 26–31 步为
 暂停 / 恢复完整走查、第 32–37 步为候补队列完整走查。
+候选集预筛的专项走查：[`examples/pruning_walkthrough.sh`](examples/pruning_walkthrough.sh)
+（大量时段/覆盖/频段不相交的有效许可不会再被逐条装入；保护带宽变更仍检查全部许可对）。
 
 ### 6.16 临时停机：暂停 → 期间另批新许可 → 恢复互扰 → 撤销新许可 → 恢复
 
@@ -1775,6 +1802,7 @@ curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
 │   └── errors.py               # 统一错误信封
 ├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
+├── examples/pruning_walkthrough.sh # 候选集预筛走查（大量时段不相交记录不再逐条装入）
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动
 ├── requirements.txt / requirements-dev.txt

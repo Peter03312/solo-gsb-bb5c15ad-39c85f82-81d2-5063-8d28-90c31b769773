@@ -114,6 +114,35 @@ def _ensure_approval_event_waitlist_columns() -> None:
             )
 
 
+def _ensure_candidate_pruning_indexes() -> None:
+    """Create idempotent indexes backing the adjudication candidate pruning.
+
+    Every adjudication narrows the database candidate set in SQL by the
+    half-open time interval, the coverage bbox and the closed frequency
+    band before the exact in-Python rules run.  These b-tree indexes keep
+    those scans cheap as the effective-license / active-window tables grow
+    (most rows are skipped by the range predicates).  ``IF NOT EXISTS``
+    makes creation safe on every startup and on both PostgreSQL and the
+    SQLite test backend; missing indexes only cost speed, never
+    correctness.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_applications_effective_pruning "
+                "ON applications (status, start_time, end_time, freq_low, freq_high)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_restriction_windows_pruning "
+                "ON restriction_windows (start_time, end_time, freq_low, freq_high)"
+            )
+        )
+
+
 def _ensure_emergency_columns() -> None:
     """Add emergency-occupation-era columns to older databases.
 
@@ -204,6 +233,7 @@ def init_db() -> None:
     _ensure_suspended_revision_column()
     _ensure_approval_event_waitlist_columns()
     _ensure_emergency_columns()
+    _ensure_candidate_pruning_indexes()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)
         if meta is None:
