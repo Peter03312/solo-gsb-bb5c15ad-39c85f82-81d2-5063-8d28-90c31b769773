@@ -114,6 +114,47 @@ def _ensure_approval_event_waitlist_columns() -> None:
             )
 
 
+def _ensure_narrowing_indexes() -> None:
+    """Create the candidate-narrowing indexes on older databases.
+
+    ``create_all`` only creates missing tables/indexes for a fresh
+    database, so databases created before adjudication narrowed its
+    candidate set get these indexes added idempotently (by name).  They
+    back the status/time/frequency/coverage predicates used to shrink the
+    effective-license and active-window candidate sets before the exact
+    in-process interference rules run.
+    """
+    wanted = {
+        "applications": (
+            ("ix_applications_status_time", "status", "start_time", "end_time"),
+            ("ix_applications_status_freq", "status", "freq_low", "freq_high"),
+            ("ix_applications_status_space", "status", "cx", "cy"),
+        ),
+        "restriction_windows": (
+            ("ix_restriction_windows_time", "start_time", "end_time"),
+            ("ix_restriction_windows_freq", "freq_low", "freq_high"),
+            ("ix_restriction_windows_space", "cx", "cy"),
+        ),
+    }
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        for table, indexes in wanted.items():
+            if table not in existing_tables:
+                continue
+            present = {ix["name"] for ix in inspector.get_indexes(table)}
+            for name, *columns in indexes:
+                if name in present:
+                    continue
+                column_list = ", ".join(columns)
+                conn.execute(
+                    text(
+                        f"CREATE INDEX IF NOT EXISTS {name} "
+                        f"ON {table} ({column_list})"
+                    )
+                )
+
+
 def _ensure_emergency_columns() -> None:
     """Add emergency-occupation-era columns to older databases.
 
@@ -204,6 +245,7 @@ def init_db() -> None:
     _ensure_suspended_revision_column()
     _ensure_approval_event_waitlist_columns()
     _ensure_emergency_columns()
+    _ensure_narrowing_indexes()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)
         if meta is None:

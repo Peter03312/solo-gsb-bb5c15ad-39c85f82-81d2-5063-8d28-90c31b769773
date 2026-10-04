@@ -140,6 +140,17 @@ class Application(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
+    # The adjudication chains narrow their database candidate set by
+    # status + time window / frequency band / coverage before the exact
+    # in-process interference predicates run, so the leading columns are
+    # indexed; SQLite/PostgreSQL also use the trailing columns for the
+    # corresponding range predicates.
+    __table_args__ = (
+        Index("ix_applications_status_time", "status", "start_time", "end_time"),
+        Index("ix_applications_status_freq", "status", "freq_low", "freq_high"),
+        Index("ix_applications_status_space", "status", "cx", "cy"),
+    )
+
 
 class ApprovalEvent(Base):
     __tablename__ = "approval_events"
@@ -403,6 +414,15 @@ class RestrictionWindow(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    # Window-hit adjudication narrows by the same three dimensions (with
+    # closed-band frequency intersection; the guard band never widens a
+    # window), so the active-window table carries matching indexes.
+    __table_args__ = (
+        Index("ix_restriction_windows_time", "start_time", "end_time"),
+        Index("ix_restriction_windows_freq", "freq_low", "freq_high"),
+        Index("ix_restriction_windows_space", "cx", "cy"),
     )
 
 

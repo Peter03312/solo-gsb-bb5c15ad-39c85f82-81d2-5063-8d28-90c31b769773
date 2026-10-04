@@ -214,12 +214,14 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from . import adjudication
@@ -464,6 +466,257 @@ def load_effective_licenses(session) -> list[License]:
 
 
 # --------------------------------------------------------------------------- #
+# Database candidate-set narrowing
+# --------------------------------------------------------------------------- #
+# Every adjudication chain first narrows the database candidate set by the
+# three dimensions (half-open time window, coverage circle, frequency band)
+# and only then runs the exact in-process predicates in ``adjudication``.
+# The narrowing is deliberately an over-approximation: it may keep extra
+# rows (which the exact rules then drop), but it must never drop a row that
+# could conflict.  The coverage bounding box is a strict superset of the
+# exact disk test, and every bound additionally carries a tiny relative
+# slack so database float rounding can never turn a real conflict into a
+# filtered-out row.
+_PREFILTER_SLACK = 1e-12
+
+
+@dataclass(frozen=True)
+class _Envelope:
+    """Over-approximate bounding region of one candidate or a group.
+
+    ``[t_start, t_end)`` is the half-open time envelope; coverage is an
+    axis-aligned bounding square described by its centre ``(ccx, ccy)``
+    and half-width ``reach`` (for a single candidate its circle centre and
+    radius; for a group union the enclosing square); ``[f_low, f_high]``
+    is the closed frequency envelope (already widened by the guard band
+    for license-vs-license interference; never widened for restriction
+    windows).
+    """
+
+    t_start: datetime
+    t_end: datetime
+    ccx: float
+    ccy: float
+    reach: float
+    f_low: float
+    f_high: float
+
+
+def _bound_slack(bound: float) -> float:
+    """A few ulps of outward slack for a float prefilter bound."""
+    if bound == 0.0:
+        return _PREFILTER_SLACK
+    return abs(bound) * _PREFILTER_SLACK
+
+
+def _union_envelopes(envelopes: Sequence[_Envelope]) -> _Envelope:
+    """Axis-aligned union of several envelopes (an over-approximation)."""
+    x_min = min(e.ccx - e.reach for e in envelopes)
+    x_max = max(e.ccx + e.reach for e in envelopes)
+    y_min = min(e.ccy - e.reach for e in envelopes)
+    y_max = max(e.ccy + e.reach for e in envelopes)
+    return _Envelope(
+        t_start=min(e.t_start for e in envelopes),
+        t_end=max(e.t_end for e in envelopes),
+        ccx=(x_min + x_max) / 2.0,
+        ccy=(y_min + y_max) / 2.0,
+        reach=max(x_max - x_min, y_max - y_min) / 2.0,
+        f_low=min(e.f_low for e in envelopes),
+        f_high=max(e.f_high for e in envelopes),
+    )
+
+
+def _candidate_envelope(
+    candidate: License, guard_band: float = 0.0
+) -> _Envelope:
+    """Envelope of one license-shaped candidate for license interference.
+
+    The frequency envelope is widened by the non-negative guard band: a
+    license conflicts when the closed bands intersect *or* their gap is
+    strictly smaller than the band, so every possible interferer must lie
+    inside ``[freq_low - guard, freq_high + guard]``.
+    """
+    return _Envelope(
+        t_start=candidate.start_time,
+        t_end=candidate.end_time,
+        ccx=candidate.circle.cx,
+        ccy=candidate.circle.cy,
+        # Outward slack lives in the SQL space predicate (which performs
+        # column arithmetic); see ``_space_filters``.
+        reach=candidate.circle.radius,
+        f_low=candidate.freq_low - guard_band,
+        f_high=candidate.freq_high + guard_band,
+    )
+
+
+def _window_hit_envelope(candidate: License) -> _Envelope:
+    """Envelope for candidate-vs-window hits.
+
+    Window hits require an actual closed-band intersection; the guard band
+    never extends a window, so no frequency widening is applied.
+    """
+    return _candidate_envelope(candidate, 0.0)
+
+
+def _group_envelope(
+    candidates: Sequence[License], guard_band: float
+) -> _Envelope:
+    """Union envelope of a batch's members for narrowing the effective set."""
+    return _union_envelopes(
+        [_candidate_envelope(c, guard_band) for c in candidates]
+    )
+
+
+def _available_ranges_envelope(
+    candidate: License,
+    guard_band: float,
+    low_min: float,
+    low_max: float,
+) -> _Envelope:
+    """Envelope sweeping every attainable band position in an ranges query.
+
+    The candidate keeps its circle and time window and its band width; the
+    lower bound varies over the closed ``[low_min, low_max]`` interval, so
+    the frequency envelope spans the whole swept span plus the guard band
+    on each side.  A license outside it forbids no attainable lower bound.
+    """
+    width = candidate.freq_high - candidate.freq_low
+    base = _candidate_envelope(candidate, guard_band)
+    return _Envelope(
+        t_start=base.t_start,
+        t_end=base.t_end,
+        ccx=base.ccx,
+        ccy=base.ccy,
+        reach=base.reach,
+        f_low=low_min - guard_band,
+        f_high=low_max + width + guard_band,
+    )
+
+
+def _proposed_window_envelope(window: RestrictionWindow) -> _Envelope:
+    """Envelope of a (possibly not-yet-persisted) restriction window."""
+    return _Envelope(
+        t_start=window.start_time,
+        t_end=window.end_time,
+        ccx=window.circle.cx,
+        ccy=window.circle.cy,
+        reach=window.circle.radius,
+        f_low=window.freq_low,
+        f_high=window.freq_high,
+    )
+
+
+def _space_filters(model, envelope: _Envelope):
+    """Necessary bounding-square overlap conditions for disk intersection.
+
+    Two disks with centres ``(x, y)`` / ``(ccx, ccy)`` and radii
+    ``radius`` / ``reach`` can intersect only if the centre distance is at
+    most ``radius + reach``, which implies each coordinate separation is
+    bounded by that sum.  The inequality carries a relative slack term so
+    database-side float arithmetic (``x - ccx`` and ``radius + reach``)
+    can never round a genuinely touching/overlapping pair out of the
+    candidate set; it only keeps a few extra ulps of irrelevant rows,
+    which the exact in-process predicates drop.
+    """
+    reach = envelope.reach + _bound_slack(envelope.reach)
+    margin = model.radius + reach
+    # The margin slack also covers the coordinate subtraction rounding:
+    # ``1 + |dx|`` dominates both |dx| and the radius sum's magnitude.
+    eps_margin = (margin + 1.0) * _PREFILTER_SLACK
+    return [
+        func.abs(model.cx - envelope.ccx) <= margin + eps_margin,
+        func.abs(model.cy - envelope.ccy) <= margin + eps_margin,
+    ]
+
+
+def _apply_application_filters(query, envelope: _Envelope, *, status=None):
+    """Narrow an ``Application`` query to an envelope's possible matches.
+
+    Time uses the exact half-open overlap condition (``start < other_end``
+    and ``other_start < end``); space uses the necessary bounding-square
+    condition (a disk pair whose centres are farther apart on either axis
+    than the sum of radii cannot intersect); frequency uses closed-band
+    overlap against the envelope's (possibly guard-widened) span.
+    """
+    if status is not None:
+        query = query.filter(Application.status == status)
+    query = query.filter(
+        Application.start_time < _stored_instant(envelope.t_end),
+        Application.end_time > _stored_instant(envelope.t_start),
+        Application.freq_low <= envelope.f_high,
+        Application.freq_high >= envelope.f_low,
+    )
+    return query.filter(*_space_filters(Application, envelope))
+
+
+def _apply_window_filters(query, envelope: _Envelope):
+    """Narrow a ``RestrictionWindow`` query to an envelope's possible hits."""
+    query = query.filter(
+        RestrictionWindowRow.start_time < _stored_instant(envelope.t_end),
+        RestrictionWindowRow.end_time > _stored_instant(envelope.t_start),
+        RestrictionWindowRow.freq_low <= envelope.f_high,
+        RestrictionWindowRow.freq_high >= envelope.f_low,
+    )
+    return query.filter(*_space_filters(RestrictionWindowRow, envelope))
+
+
+def load_candidate_effective_licenses(
+    session,
+    envelope: _Envelope,
+    *,
+    exclude_ids: Iterable[int] = (),
+    extra_licenses: Sequence[License] = (),
+) -> list[License]:
+    """Effective licenses that could interfere with ``envelope``.
+
+    Narrowed counterpart of :func:`load_effective_licenses`: the database
+    only returns effective rows whose time window, coverage bounding box
+    and (guard-widened) frequency span can meet the envelope, and the
+    exact rules run afterwards.  ``exclude_ids`` drops rows by id (e.g. a
+    handover source).  ``extra_licenses`` appends already-known in-memory
+    licenses (e.g. ones approved earlier in the same drain) in their given
+    order, preserving the exact conflict ordering of a full scan.
+    """
+    excluded = set(exclude_ids)
+    query = _apply_application_filters(
+        session.query(Application), envelope, status="approved"
+    )
+    if excluded:
+        query = query.filter(~Application.id.in_(excluded))
+    rows = query.order_by(Application.id).all()
+    licenses = [to_license(row) for row in rows]
+    licenses.extend(extra_licenses)
+    return licenses
+
+
+def load_candidate_windows(
+    session, envelope: _Envelope
+) -> list[RestrictionWindowRow]:
+    """Active window rows that could hit ``envelope`` (id ordered).
+
+    The guard band never extends a window: callers pass an envelope built
+    without frequency widening.
+    """
+    return (
+        _apply_window_filters(
+            session.query(RestrictionWindowRow), envelope
+        )
+        .order_by(RestrictionWindowRow.id)
+        .all()
+    )
+
+
+def load_active_window_ids(session) -> list[int]:
+    """Ids of every active window in confirmation order (for response fields)."""
+    return [
+        row_id
+        for (row_id,) in session.query(RestrictionWindowRow.id)
+        .order_by(RestrictionWindowRow.id)
+        .all()
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # Burst-communication emergency frequency occupations
 # --------------------------------------------------------------------------- #
 def load_active_emergencies(session) -> list[EmergencyOccupation]:
@@ -608,14 +861,7 @@ def emergency_preview_body(
 
     active_occupations = load_active_emergencies(session)
     emergency_ids = emergency_application_ids(active_occupations)
-    effective = load_effective_licenses(session)
-    ordinary_effective = [
-        lic for lic in effective if lic.application_id not in emergency_ids
-    ]
-    emergency_effective = [
-        lic for lic in effective if lic.application_id in emergency_ids
-    ]
-    window_rows = load_active_windows(session)
+    all_window_ids = load_active_window_ids(session)
 
     ordinary_conflicts: list[Conflict] = []
     emergency_conflicts: list[Conflict] = []
@@ -623,6 +869,21 @@ def emergency_preview_body(
     waitlist_position = None
     if row is not None:
         candidate = to_license(row)
+        # Narrow the effective set in the database by time, coverage and
+        # guard-widened frequency before the exact predicates run.
+        effective = load_candidate_effective_licenses(
+            session, _candidate_envelope(candidate, guard_band)
+        )
+        ordinary_effective = [
+            lic for lic in effective if lic.application_id not in emergency_ids
+        ]
+        emergency_effective = [
+            lic for lic in effective if lic.application_id in emergency_ids
+        ]
+        # The guard band never extends a window: no frequency widening.
+        window_rows = load_candidate_windows(
+            session, _window_hit_envelope(candidate)
+        )
         ordinary_conflicts = adjudication.evaluate(
             candidate, ordinary_effective, guard_band
         )
@@ -686,7 +947,7 @@ def emergency_preview_body(
         "restriction_window_conflicts": [
             serialize_window_hit(h) for h in window_hits
         ],
-        "active_restriction_window_ids": [w.id for w in window_rows],
+        "active_restriction_window_ids": all_window_ids,
         # Revisions the confirm would consume: one per forced suspension,
         # then the emergency approval.
         "planned_first_force_suspension_revision": (
@@ -823,7 +1084,6 @@ def drain_waitlist(
     session,
     meta: RevisionMeta,
     release_revision: int,
-    window_rows: list[RestrictionWindowRow] | None = None,
 ) -> dict[str, Any]:
     """Re-adjudicate the standby queue after an effective license was released.
 
@@ -840,10 +1100,16 @@ def drain_waitlist(
       restriction window keeps its place in the queue and the drain
       continues with the following entries.
 
-    Restriction windows are enforced with the live set of active window rows
-    (the guard band never extends a window).  Releasing a window itself never
-    calls this function, so lifting a control only affects later
-    adjudications and never auto-approves standbys.
+    Each entry narrows the database candidate set by its own time window,
+    coverage and (guard-widened) frequency span before the exact predicates
+    run, so effective licenses disjoint in every dimension are never
+    loaded; licenses approved earlier in this same drain are appended in
+    memory in approval order, preserving the exact conflict ordering of a
+    full effective-set scan.  Restriction windows are enforced with the
+    live set of active window rows (the guard band never extends a
+    window).  Releasing a window itself never calls this function, so
+    lifting a control only affects later adjudications and never
+    auto-approves standbys.
 
     Manually approved applications have had their queue entries removed by
     the approve/batch handlers, so a queued application is never
@@ -853,14 +1119,14 @@ def drain_waitlist(
     historical revision snapshots restore the automatic decisions.
     """
     guard_band = meta.guard_band
-    effective = load_effective_licenses(session)
-    window_rows = (
-        window_rows if window_rows is not None else load_active_windows(session)
-    )
-    window_views = [to_window(row) for row in window_rows]
 
     approved: list[dict[str, Any]] = []
     pending_details: list[dict[str, Any]] = []
+    # Licenses made effective earlier in this same drain: re-adjudicated
+    # in-memory (and excluded from the per-entry narrowed query) so later
+    # entries see them in exactly the old full-scan append order.
+    newly_effective: list[License] = []
+    newly_effective_ids: set[int] = set()
     for entry in load_waitlist(session):
         row = session.get(Application, entry.application_id)
         # Defensive: only genuinely pending applications can be queued; skip
@@ -869,10 +1135,17 @@ def drain_waitlist(
         if row is None or row.status != "pending":
             continue
         candidate = to_license(row)
-        conflicts = adjudication.evaluate(candidate, effective, guard_band)
-        hits = adjudication.evaluate_restriction_windows(
-            candidate, window_views
+        effective = load_candidate_effective_licenses(
+            session,
+            _candidate_envelope(candidate, guard_band),
+            exclude_ids=newly_effective_ids,
+            extra_licenses=newly_effective,
         )
+        conflicts = adjudication.evaluate(candidate, effective, guard_band)
+        window_rows = load_candidate_windows(
+            session, _window_hit_envelope(candidate)
+        )
+        hits = window_hits_for(candidate, window_rows)
         if conflicts or hits:
             # Still blocked (by a license or by a restriction window): keep
             # the queue entry and carry on with the rest.
@@ -908,7 +1181,8 @@ def drain_waitlist(
         invalidate_scheduled_approvals(
             session, row.id, "waitlist_auto_approval"
         )
-        effective.append(candidate)
+        newly_effective.append(candidate)
+        newly_effective_ids.add(row.id)
         approved.append(
             {
                 "application_id": row.id,
@@ -1092,11 +1366,15 @@ def process_due_scheduled_approvals(
             continue
 
         candidate = to_license(row)
-        effective = load_effective_licenses(session)
+        effective = load_candidate_effective_licenses(
+            session, _candidate_envelope(candidate, meta.guard_band)
+        )
         conflicts = adjudication.evaluate(
             candidate, effective, meta.guard_band
         )
-        window_rows = load_active_windows(session)
+        window_rows = load_candidate_windows(
+            session, _window_hit_envelope(candidate)
+        )
         window_hits = window_hits_for(candidate, window_rows)
 
         if conflicts or window_hits:
@@ -1160,8 +1438,9 @@ def process_due_scheduled_approvals(
             }
         )
         # The new license participates in the adjudication of the later due
-        # appointments processed by this same sweep.
-        effective = load_effective_licenses(session)
+        # appointments processed by this same sweep: each appointment runs
+        # its own narrowed effective-set query, which auto-flushes the
+        # approved status before executing.
     return results
 
 
@@ -1292,20 +1571,30 @@ def transfer_preview_body(
     # Adjudicate the successor with the source license removed from the
     # effective set.  The successor is pending so it is never itself in that
     # set; the id filter also keeps the exclusion meaningful in every state.
-    effective = [
-        lic
-        for lic in load_effective_licenses(session)
-        if lic.application_id
-        not in (payload.source_application_id, payload.successor_application_id)
-    ]
-    window_rows = load_active_windows(session)
-
+    # The effective set is narrowed in the database by the successor's time
+    # window, coverage and guard-widened frequency envelope first.
+    excluded_ids = {
+        payload.source_application_id,
+        payload.successor_application_id,
+    }
     conflicts: list = []
     window_hits: list = []
     if successor is not None:
         candidate = to_license(successor)
+        effective = load_candidate_effective_licenses(
+            session,
+            _candidate_envelope(candidate, guard_band),
+            exclude_ids=excluded_ids,
+        )
+        window_rows = load_candidate_windows(
+            session, _window_hit_envelope(candidate)
+        )
         conflicts = adjudication.evaluate(candidate, effective, guard_band)
         window_hits = window_hits_for(candidate, window_rows)
+    else:
+        effective = []
+        window_rows = []
+    all_window_ids = load_active_window_ids(session)
 
     if conflicts:
         blockers.append(
@@ -1361,7 +1650,7 @@ def transfer_preview_body(
         "restriction_window_conflicts": [
             serialize_window_hit(h) for h in window_hits
         ],
-        "active_restriction_window_ids": [row.id for row in window_rows],
+        "active_restriction_window_ids": all_window_ids,
         # On a successful confirm the two revisions the handover consumes.
         "planned_revoc_revision": current + 1,
         "planned_successor_revision": current + 2,
@@ -2507,10 +2796,18 @@ def preview_application(application_id: int) -> dict[str, Any]:
         meta = session.get(RevisionMeta, 1)
         current = meta.revision
         guard_band = meta.guard_band
-        effective = load_effective_licenses(session)
-        conflicts = adjudication.evaluate(to_license(row), effective, guard_band)
-        window_rows = load_active_windows(session)
-        window_hits = window_hits_for(to_license(row), window_rows)
+        candidate = to_license(row)
+        # Narrow the database candidate set by time, coverage and the
+        # guard-widened frequency span before the exact predicates run.
+        effective = load_candidate_effective_licenses(
+            session, _candidate_envelope(candidate, guard_band)
+        )
+        conflicts = adjudication.evaluate(candidate, effective, guard_band)
+        window_rows = load_candidate_windows(
+            session, _window_hit_envelope(candidate)
+        )
+        window_hits = window_hits_for(candidate, window_rows)
+        active_window_ids = load_active_window_ids(session)
 
     return {
         "application_id": application_id,
@@ -2525,7 +2822,7 @@ def preview_application(application_id: int) -> dict[str, Any]:
         "restriction_window_conflicts": [
             serialize_window_hit(h) for h in window_hits
         ],
-        "active_restriction_window_ids": [row.id for row in window_rows],
+        "active_restriction_window_ids": active_window_ids,
     }
 
 
@@ -2582,10 +2879,29 @@ def find_available_ranges(
         current = meta.revision
         guard_band = meta.guard_band
         bandwidth = row.freq_high - row.freq_low
-        effective = load_effective_licenses(session)
-        window_rows = load_active_windows(session)
+        candidate = to_license(row)
+        # The lower bound sweeps the whole [candidate_low_min,
+        # candidate_low_max] interval, so the envelope spans the whole
+        # swept band (plus guard band); licenses/windows outside it can
+        # forbid no attainable lower bound and are never loaded.
+        license_envelope = _available_ranges_envelope(
+            candidate,
+            guard_band,
+            payload.candidate_low_min,
+            payload.candidate_low_max,
+        )
+        effective = load_candidate_effective_licenses(
+            session, license_envelope
+        )
+        # Windows use closed-band intersection with no guard widening;
+        # cover the same swept lower-bound interval.
+        window_envelope = _available_ranges_envelope(
+            candidate, 0.0, payload.candidate_low_min, payload.candidate_low_max
+        )
+        window_rows = load_candidate_windows(session, window_envelope)
+        active_window_ids = load_active_window_ids(session)
         ranges = adjudication.available_ranges(
-            to_license(row),
+            candidate,
             effective,
             guard_band,
             payload.candidate_low_min,
@@ -2600,7 +2916,7 @@ def find_available_ranges(
         "bandwidth": bandwidth,
         "candidate_low_min": payload.candidate_low_min,
         "candidate_low_max": payload.candidate_low_max,
-        "active_restriction_window_ids": [row.id for row in window_rows],
+        "active_restriction_window_ids": active_window_ids,
         "available_ranges": [
             {
                 "min": r.min,
@@ -2666,13 +2982,19 @@ def approve_application(
                     )
 
                 # Re-adjudicate under the lock against the latest effective
-                # set and the live guard band.
-                effective = load_effective_licenses(session)
-                conflicts = adjudication.evaluate(
-                    to_license(row), effective, guard_band
+                # set and the live guard band, after narrowing the database
+                # candidate set by time, coverage and frequency.
+                candidate = to_license(row)
+                effective = load_candidate_effective_licenses(
+                    session, _candidate_envelope(candidate, guard_band)
                 )
-                window_rows = load_active_windows(session)
-                window_hits = window_hits_for(to_license(row), window_rows)
+                conflicts = adjudication.evaluate(
+                    candidate, effective, guard_band
+                )
+                window_rows = load_candidate_windows(
+                    session, _window_hit_envelope(candidate)
+                )
+                window_hits = window_hits_for(candidate, window_rows)
                 if window_hits:
                     # A hit window forbids the grant even when no license
                     # interferes; the application stays pending and no
@@ -2897,14 +3219,23 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                 # Failure type 4: interference or restriction-window hits,
                 # re-adjudicated under the lock.  Every member is checked
                 # against the current effective set, every other member of
-                # the group, and every active restriction window.
+                # the group, and every active restriction window.  The
+                # effective/window candidate sets are narrowed in the
+                # database by the union envelope of the group members.
                 ordered_rows = [rows_by_id[i] for i in payload.application_ids]
                 candidates = [to_license(row) for row in ordered_rows]
-                effective = load_effective_licenses(session)
+                effective = load_candidate_effective_licenses(
+                    session, _group_envelope(candidates, guard_band)
+                )
                 against_effective, within_group = adjudication.evaluate_group(
                     candidates, effective, guard_band
                 )
-                window_rows = load_active_windows(session)
+                window_rows = load_candidate_windows(
+                    session,
+                    _union_envelopes(
+                        [_window_hit_envelope(c) for c in candidates]
+                    ),
+                )
                 window_hit_ids: set[int] = set()
                 interference_details = []
                 for candidate in candidates:
@@ -3358,14 +3689,21 @@ def resume_application(
                     )
 
                 # Re-adjudicate under the lock against the latest effective
-                # set and the live guard band.  The resuming license itself
-                # is still suspended, so it is not part of that set.
-                effective = load_effective_licenses(session)
-                conflicts = adjudication.evaluate(
-                    to_license(row), effective, guard_band
+                # set and the live guard band, after narrowing the database
+                # candidate set by time, coverage and frequency.  The
+                # resuming license itself is still suspended, so it is not
+                # part of that set.
+                candidate = to_license(row)
+                effective = load_candidate_effective_licenses(
+                    session, _candidate_envelope(candidate, guard_band)
                 )
-                window_rows = load_active_windows(session)
-                window_hits = window_hits_for(to_license(row), window_rows)
+                conflicts = adjudication.evaluate(
+                    candidate, effective, guard_band
+                )
+                window_rows = load_candidate_windows(
+                    session, _window_hit_envelope(candidate)
+                )
+                window_hits = window_hits_for(candidate, window_rows)
                 if window_hits:
                     raise APIError(
                         E_RESTRICTION_WINDOW,
@@ -4035,9 +4373,19 @@ def _window_preview_body(
     meta = session.get(RevisionMeta, 1)
     current = meta.revision
     window = proposed_window(payload)
+    envelope = _proposed_window_envelope(window)
 
+    # Narrow the effective set by the window's own time/coverage/closed-band
+    # envelope first; the guard band never extends a window.
     effective_hits: list[dict[str, Any]] = []
-    for lic in load_effective_licenses(session):
+    for app_row in (
+        _apply_application_filters(
+            session.query(Application), envelope, status="approved"
+        )
+        .order_by(Application.id)
+        .all()
+    ):
+        lic = to_license(app_row)
         hit = adjudication.restriction_window_hit(lic, window)
         if hit is not None:
             effective_hits.append(
@@ -4052,10 +4400,30 @@ def _window_preview_body(
                 }
             )
 
+    # The queue position is defined against the full FIFO queue, so
+    # positions are numbered from it; only envelope-matching pending
+    # applications are fetched for the exact hit test.
+    all_entries = load_waitlist(session)
+    candidate_ids = {entry.application_id for entry in all_entries}
+    candidate_rows: dict[int, Application] = {}
+    if candidate_ids:
+        for app_row in (
+            _apply_application_filters(
+                session.query(Application).filter(
+                    Application.id.in_(candidate_ids)
+                ),
+                envelope,
+                status="pending",
+            )
+            .order_by(Application.id)
+            .all()
+        ):
+            candidate_rows[app_row.id] = app_row
+
     waitlist_hits: list[dict[str, Any]] = []
-    for position, entry in enumerate(load_waitlist(session), start=1):
-        row = session.get(Application, entry.application_id)
-        if row is None or row.status != "pending":
+    for position, entry in enumerate(all_entries, start=1):
+        row = candidate_rows.get(entry.application_id)
+        if row is None:
             continue
         lic = to_license(row)
         hit = adjudication.restriction_window_hit(lic, window)
@@ -4746,17 +5114,20 @@ def confirm_license_transfer(
                     )
 
                 # Re-adjudicate under the lock with the source license
-                # removed from the effective set.
-                effective = [
-                    lic
-                    for lic in load_effective_licenses(session)
-                    if lic.application_id != source.id
-                ]
+                # removed from the effective set, after narrowing the
+                # database candidate set by the successor's envelope.
                 candidate = to_license(successor)
+                effective = load_candidate_effective_licenses(
+                    session,
+                    _candidate_envelope(candidate, guard_band),
+                    exclude_ids={source.id, successor.id},
+                )
                 conflicts = adjudication.evaluate(
                     candidate, effective, guard_band
                 )
-                window_rows = load_active_windows(session)
+                window_rows = load_candidate_windows(
+                    session, _window_hit_envelope(candidate)
+                )
                 window_hits = window_hits_for(candidate, window_rows)
                 if window_hits:
                     raise APIError(
@@ -4991,12 +5362,15 @@ def confirm_emergency_occupation(
                         },
                     )
 
-                # Re-adjudicate under the lock, splitting the effective set
-                # into ordinary licenses (force-suspend candidates) and
-                # emergency licenses (hard blockers).
+                # Re-adjudicate under the lock, splitting the narrowed
+                # effective set into ordinary licenses (force-suspend
+                # candidates) and emergency licenses (hard blockers).
                 active_occupations = load_active_emergencies(session)
                 emergency_ids = emergency_application_ids(active_occupations)
-                effective = load_effective_licenses(session)
+                candidate = to_license(row)
+                effective = load_candidate_effective_licenses(
+                    session, _candidate_envelope(candidate, guard_band)
+                )
                 ordinary_effective = [
                     lic
                     for lic in effective
@@ -5007,14 +5381,15 @@ def confirm_emergency_occupation(
                     for lic in effective
                     if lic.application_id in emergency_ids
                 ]
-                candidate = to_license(row)
                 ordinary_conflicts = adjudication.evaluate(
                     candidate, ordinary_effective, guard_band
                 )
                 emergency_conflicts = adjudication.evaluate(
                     candidate, emergency_effective, guard_band
                 )
-                window_rows = load_active_windows(session)
+                window_rows = load_candidate_windows(
+                    session, _window_hit_envelope(candidate)
+                )
                 window_hits = window_hits_for(candidate, window_rows)
                 if window_hits:
                     raise APIError(
@@ -5281,9 +5656,11 @@ def release_emergency_occupation(
                 )
                 restored: list[dict[str, Any]] = []
                 blocked: list[dict[str, Any]] = []
-                effective = load_effective_licenses(session)
-                window_rows = load_active_windows(session)
-                window_views = [to_window(w) for w in window_rows]
+                # Licenses restored earlier in this same release are
+                # re-adjudicated in-memory in restoration order, matching
+                # the ordering of the previous full-scan append.
+                restored_licenses: list[License] = []
+                restored_ids: set[int] = set()
                 for susp_event in forced_events:
                     lic_row = session.get(
                         Application, susp_event.application_id
@@ -5299,11 +5676,20 @@ def release_emergency_occupation(
                     ):
                         continue
                     candidate = to_license(lic_row)
+                    effective = load_candidate_effective_licenses(
+                        session,
+                        _candidate_envelope(candidate, guard_band),
+                        exclude_ids=restored_ids,
+                        extra_licenses=restored_licenses,
+                    )
                     conflicts = adjudication.evaluate(
                         candidate, effective, guard_band
                     )
-                    hits = adjudication.evaluate_restriction_windows(
-                        candidate, window_views
+                    hits = window_hits_for(
+                        candidate,
+                        load_candidate_windows(
+                            session, _window_hit_envelope(candidate)
+                        ),
                     )
                     if conflicts or hits:
                         # Stays suspended: the emergency is over, so it is an
@@ -5339,7 +5725,8 @@ def release_emergency_occupation(
                     lic_row.status = "approved"
                     lic_row.suspended_revision = None
                     lic_row.force_suspended_by = None
-                    effective.append(candidate)
+                    restored_licenses.append(candidate)
+                    restored_ids.add(lic_row.id)
                     restored.append(
                         {
                             "revision": meta.revision,

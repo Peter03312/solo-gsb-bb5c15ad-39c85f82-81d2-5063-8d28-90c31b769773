@@ -173,6 +173,35 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 裁决只考虑**有效集合**：已批准、当前未暂停且未被撤销的申请。待审批、已暂停、
 已撤销均不参与。
 
+### 裁决前的数据库候选集收窄（不漏判的预过滤）
+
+申请量增长后，单笔、整组、恢复、候补、预约到期及紧急占用的每条裁决链都不再先
+把全部有效许可和生效管制窗口逐条装入内存，而是**先在数据库内按时段、覆盖范围
+和频段缩小候选集，再沿用上面的精确干扰与窗口命中规则**逐条判定：
+
+- **时段**：用与裁决一致的左闭右开区间重叠条件（`start < other_end` 且
+  `other_start < end`）过滤，端点相接的不装入；
+- **覆盖范围**：用圆心坐标差不超过“两半径之和”的**外接方框必要条件**过滤
+  （含极小的相对容差，防止数据库浮点舍入把相切对滤掉）；精确的圆心距判定仍在
+  内存中执行；
+- **频段**：许可干扰按 `[freq_low − 保护带宽, freq_high + 保护带宽]` 的闭区间
+  重叠过滤——**保护带宽只扩张许可的干扰范围**；管制窗口命中要求闭区间真实相交，
+  **保护带宽不扩张管制窗口**；
+- 整组裁决取整组成员的**并集包络**；
+- 可用频段下界查询中候选下界遍历整个闭区间 `[candidate_low_min,
+  candidate_low_max]`，许可包络覆盖 `[candidate_low_min − 保护带宽,
+  candidate_low_max + 带宽 + 保护带宽]`，**下界查询覆盖整个候选下界区间**，
+  任何在某一可达下界处可能冲突的记录都会保留；
+- 收窄只允许**多取**（多取的无关记录由精确规则丢弃，冲突明细顺序仍按申请/窗口
+  id 排序，与全量扫描完全一致），**绝不漏掉任何可能冲突的记录**；同事务内刚获批
+  的许可（候补 drain、紧急解除恢复、预约到期批量处理）仍在内存中按原追加顺序
+  参与后续裁决；
+- **保护带宽变更（预演与确认）例外**：仍装入并两两检查**全部当前有效许可**，
+  不做候选收窄；
+- `applications` 与 `restriction_windows` 上建有状态/时段、频段、覆盖范围索引
+  （旧库启动时幂等补建），大量时段互不相交的有效许可不会再被逐条装入裁决，
+  服务启动与后台预约扫描保持可用。
+
 ### 临时停机：暂停与恢复
 
 活动设备临时停机时，运营人员无需撤销许可或重提申请，可对已获批（`approved`）且
@@ -1758,6 +1787,70 @@ curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
 流量；轮询间隔可用 `SCHEDULED_APPROVAL_POLL_SECONDS` 调整，
 `SCHEDULED_APPROVAL_BACKGROUND=0` 可仅保留手动/启动处理。
 
+### 6.21 候选集收窄：大量时段不相交许可下的裁决（不漏判）
+
+下例可直接运行 `./examples/candidate-narrowing.sh`（默认 100 条无关许可，
+`N=300 ./examples/candidate-narrowing.sh` 可加压）。它先装入大量时段互不相交、
+频段与覆盖范围都很远的有效许可，再演示各裁决链只装入真正可能冲突的候选：
+
+```bash
+# 1) N 个无关有效许可（各自独占一天，频段/圆也很远）——只演示其中一个请求体
+curl -s -X POST http://localhost:8000/api/applications -H 'Content-Type: application/json' -d '{
+  "name":"unrelated-1",
+  "circle":{"cx":9000,"cy":9000,"radius":1},
+  "frequency":{"low":9000,"high":9001},
+  "time_window":{"start":"2031-01-01T00:00:00Z","end":"2031-01-01T01:00:00Z"}}'
+# -> {"id":1,...}；随后 POST /api/applications/1/approve {"expected_revision":0}
+
+# 2) 近处许可 [111,112]：与候选 [100,110] 间隔 1 MHz（< 2 MHz 保护带宽）
+# 3) 预演候选：冲突明细只有近处许可，N 个无关许可不进入数据库候选集
+curl -s -X POST http://localhost:8000/api/applications/{候选}/preview
+# -> {"current_revision":N+1,
+#     "conflicts":[{"application":{"id":N+1},"reason":"within_guard_band",...}],
+#     "restriction_window_conflicts":[],"active_restriction_window_ids":[...]}
+
+# 4) 可用频段下界查询覆盖整个候选下界区间 [90,140]（许可包络扩张到
+#    [90-保护带宽, 140+带宽+保护带宽]，窗口包络不带保护带宽）
+curl -s -X POST http://localhost:8000/api/applications/{候选}/available-ranges \
+  -H 'Content-Type: application/json' -d '{"candidate_low_min":90,"candidate_low_max":140}'
+# -> 近处许可 [111,112]（保护带宽 2）禁出开区间 (99,114)：
+#    {"available_ranges":[{"min":90,"max":99,...},{"min":114,"max":140,...}]}
+
+# 5) 锁内批准失败：409 interference，申请保持 pending，修订号不变
+curl -s -X POST http://localhost:8000/api/applications/{候选}/approve \
+  -H 'Content-Type: application/json' -d '{"expected_revision":N+1}'
+# HTTP/1.1 409 {"error":{"code":"interference",
+#   "details":{"current_revision":N+1,"conflicts":[{"application":{"id":N+1},...}]}}}
+
+# 6) 管制窗口：保护带宽不扩张窗口——间隔 1 MHz 不命中；闭区间端点相碰仍命中
+curl -s -X POST http://localhost:8000/api/restriction-windows/preview \
+  -H 'Content-Type: application/json' -d '{"circle":{"cx":0,"cy":0,"radius":10},
+    "frequency":{"low":113,"high":120},
+    "time_window":{"start":"2031-12-20T08:00:00Z","end":"2031-12-20T11:00:00Z"}}'
+# -> {"hit_count":0, ...}                          <- 1 MHz 间隔不算窗口命中
+
+# 7) 保护带宽变更仍检查全部当前有效许可对（不做候选收窄）
+curl -s -X POST http://localhost:8000/api/config/guard-band/preview \
+  -H 'Content-Type: application/json' -d '{"guard_band":3.0}'
+# -> {"effective_application_ids":[...全部 N+3 个...],
+#     "interfering_pairs":[...间隔恰为 2 MHz 的那一对在 3 MHz 下出现...]}
+
+# 8) 候补链路：候选先登记候补，撤销近处许可后在同一事务内 FIFO 自动重裁获批
+curl -s -X POST http://localhost:8000/api/applications/{候选}/waitlist \
+  -H 'Content-Type: application/json' -d '{"reason":"band busy"}'
+curl -s -X POST http://localhost:8000/api/applications/{近处许可}/revoke \
+  -H 'Content-Type: application/json' -d '{"expected_revision":N+3,"reason":"release"}'
+# -> {"revoked":true,"auto_approved_application_ids":[{候选}],
+#     "remaining_waitlist_application_ids":[],"final_revision":N+5}
+```
+
+收窄是**只多不漏**的预过滤：相切圆、频段端点相碰、保护带宽边界（间隔恰好等于
+带宽时仍装入但精确规则放行）等边界记录全部保留；冲突明细顺序、修订仲裁、失败
+时的状态（保持 pending/suspended、不占修订号）及全部 HTTP 调用与响应约定均与
+收窄前一致。整组、恢复、预约到期（`process-due` 与后台/启动扫描）和紧急占用/
+解除走同一套包络收窄 + 精确裁决；服务在大量时段不相交许可下启动与预演/写入
+均保持可用。
+
 ---
 
 ## 7. 项目结构
@@ -1765,16 +1858,17 @@ curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询、候补队列/释放自动重裁、临时管制窗口与换机许可交接预演/确认）
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询、候补队列/释放自动重裁、临时管制窗口与换机许可交接预演/确认；各裁决链先按时段/覆盖/频段在数据库内收窄候选集）
 │   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决、管制窗口命中判定（含组内两两、有效集成对检查、含窗口闭禁区的可用下界区间求解）
 │   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽、候选下界区间与管制窗口形状/过期校验）
 │   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest、RestrictionWindow*Request、LicenseTransfer*Request）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽/管制窗口/许可交接事件 + 生效管制窗口 + 候补队列 + 修订号/当前带宽）
-│   ├── db.py                   # 引擎、等待数据库、建表与旧库列升级、修订号与带宽初值初始化（重启不覆盖）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽/管制窗口/许可交接事件 + 生效管制窗口 + 候补队列 + 修订号/当前带宽；含候选收窄索引）
+│   ├── db.py                   # 引擎、等待数据库、建表与旧库列/收窄索引升级、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
-├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例）
+├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例、test_candidate_narrowing.py 候选收窄边界用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
+├── examples/candidate-narrowing.sh # 大量时段不相交许可下的候选集收窄走查（本轮）
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动
 ├── requirements.txt / requirements-dev.txt
